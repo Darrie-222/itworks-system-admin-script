@@ -5,14 +5,9 @@
 
     Windows Server 2022 administration module for Mick and Macks Pies.
 
-    The module is imported and run on the CLIENT workstation. Each function
-    sends its work to the target server over PowerShell remoting using the
-    helper functions in ExecuteOnServer.psm1, and every action is recorded in
-    an activity log held on the server.
-
     Author:  Cooper Lane
     Company: ITWorks
-    Version: 1.2
+    Version: 1.4
 #>
 
 Set-StrictMode -Version Latest
@@ -25,7 +20,10 @@ if (-not (Test-Path -Path $executeOnServerPath)) {
            "sit in the same folder.")
 }
 
-Import-Module -Name $executeOnServerPath -Force -ErrorAction Stop
+# Imported globally so that the helper functions are available at the prompt as
+# well as inside this module. Without -Global they would resolve for the
+# functions below but not for anyone typing Invoke-OnServer directly.
+Import-Module -Name $executeOnServerPath -Force -Global -ErrorAction Stop
 
 
 # Default location of the activity log on the target server.
@@ -37,10 +35,6 @@ function Write-LogEntry {
     .SYNOPSIS
     Writes a timestamped entry to the activity log.
 
-    .DESCRIPTION
-    Appends one line to the activity log in the form 'yyyy-MM-dd HH:mm:ss - message'.
-    The containing folder is created if it does not already exist.
-
     This function is designed to run ON THE SERVER. It is sent into the remote
     session by the other functions in this module rather than being called
     directly from the client.
@@ -50,9 +44,6 @@ function Write-LogEntry {
 
     .PARAMETER LogPath
     Full path of the log file. Defaults to C:\myLogs\logs.txt.
-
-    .EXAMPLE
-    Write-LogEntry -Message 'Checked if Domain Controller exists'
 
     .OUTPUTS
     System.String
@@ -92,12 +83,6 @@ function Test-ServerConnection {
     .SYNOPSIS
     Confirms the client can reach the server, run code on it, and write to its log.
 
-    .DESCRIPTION
-    Runs a short block of code on the target server which records an entry in the
-    activity log and reports the server name, operating system, and the line that
-    was just written. Use this before any other task, and whenever something is
-    not behaving as expected.
-
     .PARAMETER ComputerName
     Name or IP address of the target server.
 
@@ -106,12 +91,6 @@ function Test-ServerConnection {
 
     .PARAMETER LogPath
     Full path of the activity log on the server.
-
-    .EXAMPLE
-    Test-ServerConnection -ComputerName 10.1.1.10
-
-    .EXAMPLE
-    Test-ServerConnection -ComputerName 10.1.1.10 -Verbose
 
     .OUTPUTS
     System.Management.Automation.PSCustomObject
@@ -185,18 +164,6 @@ function New-DomainController {
     .SYNOPSIS
     Promotes a Windows Server 2022 machine to a domain controller.
 
-    .DESCRIPTION
-    Installs the Active Directory Domain Services role on the target server and
-    promotes it to the first domain controller of a new forest, then restarts it.
-
-    The server is inspected first. If it is already a domain controller the
-    function reports that and stops rather than attempting a second promotion.
-    A server that is a member of an existing domain is rejected, because a new
-    forest cannot be created on a domain member.
-
-    Administrator credentials and the Directory Services Restore Mode password
-    are prompted for at run time and are never written to disk.
-
     .PARAMETER ComputerName
     Name or IP address of the server to promote.
 
@@ -218,12 +185,6 @@ function New-DomainController {
 
     .PARAMETER LogPath
     Full path of the activity log on the server.
-
-    .EXAMPLE
-    New-DomainController -ComputerName 10.1.1.10
-
-    .EXAMPLE
-    New-DomainController -ComputerName 10.1.1.10 -NoRestart -Verbose
 
     .OUTPUTS
     System.Management.Automation.PSCustomObject
@@ -419,6 +380,223 @@ function New-DomainController {
 }
 
 
+function Join-ComputerToDomain {
+<#
+    .SYNOPSIS
+    Joins a computer to the domain, working from the domain controller.
+
+    .PARAMETER ComputerName
+    Name or IP address of the domain controller to work from.
+
+    .PARAMETER TargetComputer
+    Name or IP address of the computer being joined to the domain.
+
+    .PARAMETER DomainName
+    Domain to join the target computer to.
+
+    .PARAMETER Credential
+    Domain administrator account, used to connect to the domain controller and
+    to authorise the join. Prompted for if omitted.
+
+    .PARAMETER LocalCredential
+    Administrator account local to the target computer. Prompted for if omitted.
+
+    .PARAMETER NoRestart
+    Join the computer but leave it running. The join is not complete until the
+    target computer restarts.
+
+    .PARAMETER LogPath
+    Full path of the activity log on the server.
+
+    .OUTPUTS
+    System.Management.Automation.PSCustomObject
+#>
+    [CmdletBinding(SupportsShouldProcess = $true, ConfirmImpact = 'High')]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory = $true, Position = 0)]
+        [ValidateNotNullOrEmpty()]
+        [string]$ComputerName,
+
+        [Parameter(Mandatory = $true, Position = 1)]
+        [ValidateNotNullOrEmpty()]
+        [string]$TargetComputer,
+
+        [Parameter(Position = 2)]
+        [ValidatePattern('^[A-Za-z0-9][A-Za-z0-9.\-]*\.[A-Za-z]{2,}$')]
+        [string]$DomainName = 'CLmicksandmacks.local',
+
+        [Parameter()]
+        [System.Management.Automation.PSCredential]$Credential,
+
+        [Parameter()]
+        [System.Management.Automation.PSCredential]$LocalCredential,
+
+        [Parameter()]
+        [switch]$NoRestart,
+
+        [Parameter()]
+        [ValidateNotNullOrEmpty()]
+        [string]$LogPath = $script:DefaultLogPath
+    )
+
+    begin {
+        if (-not $PSBoundParameters.ContainsKey('Credential')) {
+            $Credential = Get-Credential -Message "Domain administrator for $DomainName"
+        }
+
+        if ($null -eq $Credential) {
+            throw 'Domain administrator credentials are required to join a computer.'
+        }
+
+        if (-not $PSBoundParameters.ContainsKey('LocalCredential')) {
+            $LocalCredential = Get-Credential -Message "Local administrator on $TargetComputer"
+        }
+
+        if ($null -eq $LocalCredential) {
+            throw "Local administrator credentials for '$TargetComputer' are required."
+        }
+    }
+
+    process {
+        $session = New-ServerSession -ComputerName $ComputerName -Credential $Credential
+
+        try {
+            # --- Step 1: confirm the target is reachable from the server ----
+            $reachParameters = @{
+                Session         = $session
+                IncludeFunction = @('Write-LogEntry')
+                ArgumentList    = @($TargetComputer, $LogPath)
+                ErrorAction     = 'Stop'
+                ScriptBlock     = {
+                    param($target, $logFilePath)
+
+                    Write-LogEntry -Message "Checked computer $target is contactable" `
+                        -LogPath $logFilePath | Out-Null
+
+                    # Port 135 is the RPC endpoint mapper used by the join itself,
+                    # so this proves more than an ICMP echo would.
+                    $rpcTest = Test-NetConnection -ComputerName $target -Port 135 `
+                        -WarningAction SilentlyContinue
+
+                    [pscustomobject]@{
+                        Target       = $target
+                        PingSucceeded = [bool]$rpcTest.PingSucceeded
+                        RpcReachable  = [bool]$rpcTest.TcpTestSucceeded
+                        RemoteAddress = $rpcTest.RemoteAddress.IPAddressToString
+                    }
+                }
+            }
+
+            $reachability = Invoke-OnServer @reachParameters
+
+            if (-not $reachability.RpcReachable) {
+                throw ("'$TargetComputer' did not answer on TCP port 135 from " +
+                       "'$ComputerName', so the domain join cannot proceed. Enable the " +
+                       "'Windows Management Instrumentation (WMI)' firewall rules on the " +
+                       "target computer and try again.")
+            }
+
+            Write-Verbose "'$TargetComputer' answered on port 135. Proceeding with the join."
+
+            $shouldProcessText = "Join to domain '$DomainName'"
+
+            if (-not $PSCmdlet.ShouldProcess($TargetComputer, $shouldProcessText)) {
+                return $reachability
+            }
+
+            # --- Step 2: join the computer to the domain --------------------
+            $joinParameters = @{
+                Session         = $session
+                IncludeFunction = @('Write-LogEntry')
+                ErrorAction     = 'Stop'
+                ArgumentList    = @($TargetComputer, $DomainName, $Credential,
+                                    $LocalCredential, $LogPath)
+                ScriptBlock     = {
+                    param($target, $domain, $domainCredential, $localCredential, $logFilePath)
+
+                    Write-LogEntry -Message 'Joined computer to Domain' `
+                        -LogPath $logFilePath | Out-Null
+
+                    $addParameters = @{
+                        ComputerName    = $target
+                        DomainName      = $domain
+                        Credential      = $domainCredential
+                        LocalCredential = $localCredential
+                        Force           = $true
+                        PassThru        = $true
+                        ErrorAction     = 'Stop'
+                    }
+
+                    $joinResult = Add-Computer @addParameters
+
+                    [pscustomobject]@{
+                        Target       = $target
+                        Domain       = $domain
+                        HasSucceeded = [bool]$joinResult.HasSucceeded
+                    }
+                }
+            }
+
+            $joinOutcome = Invoke-OnServer @joinParameters
+
+            if (-not $joinOutcome.HasSucceeded) {
+                throw "The domain join reported failure for '$TargetComputer'."
+            }
+
+            # --- Step 3: restart the target to complete the join ------------
+            $restarted = $false
+
+            if (-not $NoRestart) {
+                Write-Verbose "Restarting '$TargetComputer' to complete the join."
+
+                $restartParameters = @{
+                    Session      = $session
+                    ErrorAction  = 'SilentlyContinue'
+                    ArgumentList = @($TargetComputer, $LocalCredential)
+                    ScriptBlock  = {
+                        param($target, $localCredential)
+
+                        try {
+                            Restart-Computer -ComputerName $target -Credential $localCredential `
+                                -Force -ErrorAction Stop
+                            $true
+                        }
+                        catch {
+                            $false
+                        }
+                    }
+                }
+
+                $restarted = [bool](Invoke-OnServer @restartParameters)
+
+                if (-not $restarted) {
+                    Write-Warning ("'$TargetComputer' was joined to '$DomainName' but could " +
+                                   "not be restarted automatically. Restart it manually to " +
+                                   "complete the join.")
+                }
+            }
+
+            return [pscustomobject]@{
+                TargetComputer = $TargetComputer
+                DomainName     = $DomainName
+                RemoteAddress  = $reachability.RemoteAddress
+                RpcReachable   = $reachability.RpcReachable
+                JoinSucceeded  = $joinOutcome.HasSucceeded
+                Restarting     = $restarted
+            }
+        }
+        finally {
+            if ($null -ne $session) {
+                Remove-ServerSession -Session $session -Confirm:$false `
+                    -ErrorAction SilentlyContinue
+            }
+        }
+    }
+}
+
+
 Export-ModuleMember -Function 'Write-LogEntry',
                               'Test-ServerConnection',
-                              'New-DomainController'
+                              'New-DomainController',
+                              'Join-ComputerToDomain'
