@@ -5,9 +5,14 @@
 
     Windows Server 2022 administration module for Mick and Macks Pies.
 
+    The module is imported and run on the CLIENT workstation. Each function
+    sends its work to the target server over PowerShell remoting using the
+    helper functions in ExecuteOnServer.psm1, and every action is recorded in
+    an activity log held on the server.
+
     Author:  Cooper Lane
     Company: ITWorks
-    Version: 1.1
+    Version: 1.2
 #>
 
 Set-StrictMode -Version Latest
@@ -32,11 +37,22 @@ function Write-LogEntry {
     .SYNOPSIS
     Writes a timestamped entry to the activity log.
 
+    .DESCRIPTION
+    Appends one line to the activity log in the form 'yyyy-MM-dd HH:mm:ss - message'.
+    The containing folder is created if it does not already exist.
+
+    This function is designed to run ON THE SERVER. It is sent into the remote
+    session by the other functions in this module rather than being called
+    directly from the client.
+
     .PARAMETER Message
     Description of the task being recorded.
 
     .PARAMETER LogPath
     Full path of the log file. Defaults to C:\myLogs\logs.txt.
+
+    .EXAMPLE
+    Write-LogEntry -Message 'Checked if Domain Controller exists'
 
     .OUTPUTS
     System.String
@@ -76,6 +92,12 @@ function Test-ServerConnection {
     .SYNOPSIS
     Confirms the client can reach the server, run code on it, and write to its log.
 
+    .DESCRIPTION
+    Runs a short block of code on the target server which records an entry in the
+    activity log and reports the server name, operating system, and the line that
+    was just written. Use this before any other task, and whenever something is
+    not behaving as expected.
+
     .PARAMETER ComputerName
     Name or IP address of the target server.
 
@@ -84,6 +106,12 @@ function Test-ServerConnection {
 
     .PARAMETER LogPath
     Full path of the activity log on the server.
+
+    .EXAMPLE
+    Test-ServerConnection -ComputerName 10.1.1.10
+
+    .EXAMPLE
+    Test-ServerConnection -ComputerName 10.1.1.10 -Verbose
 
     .OUTPUTS
     System.Management.Automation.PSCustomObject
@@ -157,6 +185,18 @@ function New-DomainController {
     .SYNOPSIS
     Promotes a Windows Server 2022 machine to a domain controller.
 
+    .DESCRIPTION
+    Installs the Active Directory Domain Services role on the target server and
+    promotes it to the first domain controller of a new forest, then restarts it.
+
+    The server is inspected first. If it is already a domain controller the
+    function reports that and stops rather than attempting a second promotion.
+    A server that is a member of an existing domain is rejected, because a new
+    forest cannot be created on a domain member.
+
+    Administrator credentials and the Directory Services Restore Mode password
+    are prompted for at run time and are never written to disk.
+
     .PARAMETER ComputerName
     Name or IP address of the server to promote.
 
@@ -178,6 +218,12 @@ function New-DomainController {
 
     .PARAMETER LogPath
     Full path of the activity log on the server.
+
+    .EXAMPLE
+    New-DomainController -ComputerName 10.1.1.10
+
+    .EXAMPLE
+    New-DomainController -ComputerName 10.1.1.10 -NoRestart -Verbose
 
     .OUTPUTS
     System.Management.Automation.PSCustomObject
@@ -328,12 +374,29 @@ function New-DomainController {
             if (-not $NoRestart) {
                 Write-Verbose "Restarting '$ComputerName' to complete the promotion."
 
-                # The session is torn down by the restart. That is expected, so
-                # the resulting transport error is suppressed rather than thrown.
-                Invoke-Command -Session $session -ScriptBlock { Restart-Computer -Force } `
-                    -ErrorAction SilentlyContinue
+                # Restart-Computer cannot reliably restart the machine that is
+                # hosting the current remote session, so the restart is scheduled
+                # with shutdown.exe instead. The command returns straight away and
+                # the session drops a few seconds later, which is expected.
+                $restartOutcome = Invoke-Command -Session $session -ErrorAction SilentlyContinue `
+                    -ScriptBlock {
+                        $null = & shutdown.exe /r /t 5 /f /c 'Completing domain controller promotion'
+                        $LASTEXITCODE
+                    }
 
-                $restarted = $true
+                if ($null -eq $restartOutcome) {
+                    Write-Warning ("The restart could not be confirmed on '$ComputerName'. " +
+                                   "Check the server and restart it manually if it is still up.")
+                }
+                elseif ($restartOutcome -eq 0) {
+                    $restarted = $true
+                    Write-Verbose "Restart scheduled on '$ComputerName'."
+                }
+                else {
+                    Write-Warning ("The restart command failed on '$ComputerName' with exit " +
+                                   "code $restartOutcome. Restart the server manually to " +
+                                   "complete the promotion.")
+                }
             }
 
             return [pscustomobject]@{
