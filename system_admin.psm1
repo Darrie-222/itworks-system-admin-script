@@ -7,7 +7,7 @@
 
     Author:  Cooper Lane
     Company: ITWorks
-    Version: 1.4
+    Version: 1.5
 #>
 
 Set-StrictMode -Version Latest
@@ -35,15 +35,14 @@ function Write-LogEntry {
     .SYNOPSIS
     Writes a timestamped entry to the activity log.
 
-    This function is designed to run ON THE SERVER. It is sent into the remote
-    session by the other functions in this module rather than being called
-    directly from the client.
-
     .PARAMETER Message
     Description of the task being recorded.
 
     .PARAMETER LogPath
     Full path of the log file. Defaults to C:\myLogs\logs.txt.
+
+    .EXAMPLE
+    Write-LogEntry -Message 'Checked if Domain Controller exists'
 
     .OUTPUTS
     System.String
@@ -83,6 +82,12 @@ function Test-ServerConnection {
     .SYNOPSIS
     Confirms the client can reach the server, run code on it, and write to its log.
 
+    .DESCRIPTION
+    Runs a short block of code on the target server which records an entry in the
+    activity log and reports the server name, operating system, and the line that
+    was just written. Use this before any other task, and whenever something is
+    not behaving as expected.
+
     .PARAMETER ComputerName
     Name or IP address of the target server.
 
@@ -91,6 +96,12 @@ function Test-ServerConnection {
 
     .PARAMETER LogPath
     Full path of the activity log on the server.
+
+    .EXAMPLE
+    Test-ServerConnection -ComputerName 10.1.1.10
+
+    .EXAMPLE
+    Test-ServerConnection -ComputerName 10.1.1.10 -Verbose
 
     .OUTPUTS
     System.Management.Automation.PSCustomObject
@@ -528,7 +539,24 @@ function Join-ComputerToDomain {
                         ErrorAction     = 'Stop'
                     }
 
-                    $joinResult = Add-Computer @addParameters
+                    try {
+                        $joinResult = Add-Computer @addParameters
+                    }
+                    catch {
+                        $detail = $_.Exception.Message
+
+                        if ($detail -match 'Access is denied') {
+                            throw ("'$target' refused the local account supplied. It reached " +
+                                   "the computer but was not granted administrative rights. " +
+                                   "On a workgroup computer this is normally remote UAC token " +
+                                   "filtering: set LocalAccountTokenFilterPolicy to 1 on " +
+                                   "'$target', or supply its built-in Administrator account. " +
+                                   "Check the credential is entered as '$target\<account>'. " +
+                                   "Original error: $detail")
+                        }
+
+                        throw "The domain join failed on '$target'. $detail"
+                    }
 
                     [pscustomobject]@{
                         Target       = $target
