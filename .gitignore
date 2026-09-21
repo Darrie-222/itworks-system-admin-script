@@ -1,0 +1,29 @@
+# ITWorks - system_admin PowerShell module
+# Version control exclusions
+#
+# ITWorks_Best_Practices_For_Version_Control requires that sensitive data is
+# never committed. The user import file carries initial account passwords, so
+# the real file stays local and only the example is tracked.
+
+# --- Sensitive data -------------------------------------------------------
+users.csv
+*.creds.csv
+credentials.xml
+*.cred
+*.pfx
+*.key
+
+# --- Generated output -----------------------------------------------------
+logs.txt
+toptenerrors.txt
+myLogs/
+*.log
+
+# --- Editor and OS noise --------------------------------------------------
+.vscode/
+.vs/
+*.swp
+*~
+Thumbs.db
+desktop.ini
+$RECYCLE.BIN/
