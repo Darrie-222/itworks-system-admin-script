@@ -1,0 +1,4 @@
+Name,Path,Description
+Administration,DC=CLmicksandmacks;DC=local,Office and management staff
+Bakery,DC=CLmicksandmacks;DC=local,Production and kitchen staff
+Delivery,DC=CLmicksandmacks;DC=local,Drivers and logistics staff
