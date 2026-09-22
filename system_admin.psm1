@@ -7,7 +7,7 @@
 
     Author:  Cooper Lane
     Company: ITWorks
-    Version: 1.8
+    Version: 1.9
 #>
 
 Set-StrictMode -Version Latest
@@ -34,6 +34,15 @@ function Get-LogonDomainController {
 <#
     .SYNOPSIS
     Returns the host name of a domain controller this client can reach.
+
+    .DESCRIPTION
+    Internal helper. Remoting authenticates with Kerberos, which matches a
+    service principal name registered against a host. The domain name itself
+    has no such registration, so connecting to 'example.local' fails even
+    though the name resolves in DNS. This returns a real host name instead.
+
+    The domain controller that authenticated the current session is preferred.
+    If that is not available, the directory is queried for one.
 
     .OUTPUTS
     System.String
@@ -72,6 +81,11 @@ function Import-DirectoryCsv {
 <#
     .SYNOPSIS
     Reads a CSV on the client and checks it has the columns required.
+
+    .DESCRIPTION
+    Internal helper shared by the directory functions. Reading and validating
+    on the client means a missing file or a mistyped heading is reported before
+    a connection to the server is opened.
 
     .PARAMETER Path
     Full path of the CSV file.
@@ -155,6 +169,46 @@ function Get-CsvValue {
         }
 
         return ''
+    }
+}
+
+
+function Get-NetworkAddress {
+<#
+    .SYNOPSIS
+    Returns the network address for an address and subnet mask.
+
+    .PARAMETER IPAddress
+    Any address within the network.
+
+    .PARAMETER SubnetMask
+    Subnet mask for the network.
+
+    .OUTPUTS
+    System.String
+#>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory = $true, Position = 0)]
+        [ValidateNotNull()]
+        [ipaddress]$IPAddress,
+
+        [Parameter(Mandatory = $true, Position = 1)]
+        [ValidateNotNull()]
+        [ipaddress]$SubnetMask
+    )
+
+    process {
+        $addressBytes = $IPAddress.GetAddressBytes()
+        $maskBytes = $SubnetMask.GetAddressBytes()
+        $networkBytes = New-Object 'System.Byte[]' 4
+
+        for ($index = 0; $index -lt 4; $index++) {
+            $networkBytes[$index] = $addressBytes[$index] -band $maskBytes[$index]
+        }
+
+        return ([ipaddress]$networkBytes).IPAddressToString
     }
 }
 
@@ -1280,10 +1334,295 @@ function Add-DomainUser {
 }
 
 
+function New-DhcpScope {
+<#
+    .SYNOPSIS
+    Configures the DHCP service and creates an address pool for the office.
+
+    .PARAMETER ComputerName
+    Host name of the server to configure. Defaults to the domain controller that
+    authenticated this session.
+
+    .PARAMETER ScopeName
+    Label for the address pool.
+
+    .PARAMETER StartRange
+    First address handed out to clients.
+
+    .PARAMETER EndRange
+    Last address handed out to clients.
+
+    .PARAMETER SubnetMask
+    Subnet mask for the pool.
+
+    .PARAMETER Router
+    Default gateway given to clients. Omitted entirely when not supplied.
+
+    .PARAMETER DnsServer
+    DNS server given to clients. Defaults to the server being configured.
+
+    .PARAMETER LeaseDurationDays
+    How long a client keeps an address before renewing.
+
+    .PARAMETER Credential
+    Account used to connect. Prompted for unless -UseCurrentUser is supplied.
+
+    .PARAMETER UseCurrentUser
+    Connect as the signed-in domain account instead of prompting.
+
+    .PARAMETER LogPath
+    Full path of the activity log on the server.
+
+    .OUTPUTS
+    System.Management.Automation.PSCustomObject
+#>
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Position = 0)]
+        [ValidateNotNullOrEmpty()]
+        [string]$ComputerName,
+
+        [Parameter(Position = 1)]
+        [ValidateNotNullOrEmpty()]
+        [string]$ScopeName = 'Mick and Macks Pies LAN',
+
+        [Parameter()]
+        [ValidateNotNull()]
+        [ipaddress]$StartRange = '10.1.1.100',
+
+        [Parameter()]
+        [ValidateNotNull()]
+        [ipaddress]$EndRange = '10.1.1.200',
+
+        [Parameter()]
+        [ValidateNotNull()]
+        [ipaddress]$SubnetMask = '255.255.255.0',
+
+        [Parameter()]
+        [ipaddress]$Router,
+
+        [Parameter()]
+        [ipaddress]$DnsServer,
+
+        [Parameter()]
+        [ValidateRange(1, 30)]
+        [int]$LeaseDurationDays = 8,
+
+        [Parameter()]
+        [System.Management.Automation.PSCredential]$Credential,
+
+        [Parameter()]
+        [switch]$UseCurrentUser,
+
+        [Parameter()]
+        [ValidateNotNullOrEmpty()]
+        [string]$LogPath = $script:DefaultLogPath
+    )
+
+    begin {
+        if (-not $PSBoundParameters.ContainsKey('ComputerName')) {
+            $ComputerName = Get-LogonDomainController
+        }
+
+        # Both ends of the range must sit on the same network, or the scope is
+        # meaningless. Checking here keeps the failure local and quick.
+        $startNetwork = Get-NetworkAddress -IPAddress $StartRange -SubnetMask $SubnetMask
+        $endNetwork = Get-NetworkAddress -IPAddress $EndRange -SubnetMask $SubnetMask
+
+        if ($startNetwork -ne $endNetwork) {
+            throw ("The range $($StartRange.IPAddressToString) to " +
+                   "$($EndRange.IPAddressToString) spans two networks " +
+                   "($startNetwork and $endNetwork) under mask " +
+                   "$($SubnetMask.IPAddressToString).")
+        }
+
+        $startValue = [uint32[]]$StartRange.GetAddressBytes()
+        $endValue = [uint32[]]$EndRange.GetAddressBytes()
+
+        for ($index = 0; $index -lt 4; $index++) {
+            if ($startValue[$index] -lt $endValue[$index]) { break }
+
+            if ($startValue[$index] -gt $endValue[$index]) {
+                throw ("The start address $($StartRange.IPAddressToString) is higher than " +
+                       "the end address $($EndRange.IPAddressToString).")
+            }
+        }
+
+        $scopeId = $startNetwork
+        Write-Verbose "Scope network address is $scopeId."
+    }
+
+    process {
+        $shouldProcessText = "Configure DHCP and create the scope $scopeId"
+
+        if (-not $PSCmdlet.ShouldProcess($ComputerName, $shouldProcessText)) {
+            return
+        }
+
+        $connectionSplat = @{ ComputerName = $ComputerName }
+
+        if ($UseCurrentUser) {
+            $connectionSplat['UseCurrentUser'] = $true
+        }
+        elseif ($PSBoundParameters.ContainsKey('Credential')) {
+            $connectionSplat['Credential'] = $Credential
+        }
+
+        $routerAddress = if ($PSBoundParameters.ContainsKey('Router')) {
+                             $Router.IPAddressToString
+                         }
+                         else { '' }
+
+        $dnsAddress = if ($PSBoundParameters.ContainsKey('DnsServer')) {
+                          $DnsServer.IPAddressToString
+                      }
+                      else { '' }
+
+        $argumentList = @(
+            $scopeId,
+            $ScopeName,
+            $StartRange.IPAddressToString,
+            $EndRange.IPAddressToString,
+            $SubnetMask.IPAddressToString,
+            $routerAddress,
+            $dnsAddress,
+            $LeaseDurationDays,
+            $LogPath
+        )
+
+        $result = Invoke-OnServer @connectionSplat -ErrorAction Stop `
+            -IncludeFunction @('Write-LogEntry') -ArgumentList $argumentList -ScriptBlock {
+                param($scope, $label, $rangeStart, $rangeEnd, $mask, $gateway, $dns,
+                      $leaseDays, $logFilePath)
+
+                # --- Install the role if it is not already there -------------
+                $dhcpFeature = Get-WindowsFeature -Name 'DHCP'
+                $featureInstalled = $false
+
+                if ($dhcpFeature.InstallState -ne 'Installed') {
+                    $null = Install-WindowsFeature -Name 'DHCP' -IncludeManagementTools
+
+                    # Creates the DHCP Administrators and DHCP Users groups.
+                    $null = & netsh dhcp add securitygroups
+                    Restart-Service -Name 'dhcpserver' -Force
+
+                    $featureInstalled = $true
+                }
+
+                Import-Module -Name 'DhcpServer' -ErrorAction Stop
+
+                Write-LogEntry -Message 'Checked current DHCP settings' `
+                    -LogPath $logFilePath | Out-Null
+
+                # --- Report what is already configured -----------------------
+                $existingScopes = @(Get-DhcpServerv4Scope -ErrorAction SilentlyContinue |
+                    ForEach-Object {
+                        '{0} ({1} - {2}) {3}' -f $_.ScopeId, $_.StartRange, $_.EndRange, $_.State
+                    })
+
+                # --- Authorise the server in Active Directory ----------------
+                $computerSystem = Get-CimInstance -ClassName Win32_ComputerSystem
+                $serverFqdn = '{0}.{1}' -f $computerSystem.Name, $computerSystem.Domain
+
+                $serverAddress = (Get-NetIPAddress -AddressFamily IPv4 |
+                    Where-Object { $_.IPAddress -like ($scope -replace '\.\d+$', '.*') } |
+                    Select-Object -First 1).IPAddress
+
+                $alreadyAuthorised = @(Get-DhcpServerInDC -ErrorAction SilentlyContinue |
+                    Where-Object { $_.DnsName -eq $serverFqdn })
+
+                if ($alreadyAuthorised.Count -eq 0 -and $serverAddress) {
+                    Add-DhcpServerInDC -DnsName $serverFqdn -IPAddress $serverAddress `
+                        -ErrorAction SilentlyContinue
+                }
+
+                # Clears the post-deployment task Server Manager would show.
+                $rolePath = 'HKLM:\SOFTWARE\Microsoft\ServerManager\Roles\12'
+
+                if (Test-Path -Path $rolePath) {
+                    Set-ItemProperty -Path $rolePath -Name 'ConfigurationState' -Value 2 `
+                        -ErrorAction SilentlyContinue
+                }
+
+                # --- Create the scope ----------------------------------------
+                $scopeExists = Get-DhcpServerv4Scope -ScopeId $scope -ErrorAction SilentlyContinue
+                $scopeAction = 'Skipped'
+
+                if (-not $scopeExists) {
+                    $scopeParameters = @{
+                        Name          = $label
+                        StartRange    = $rangeStart
+                        EndRange      = $rangeEnd
+                        SubnetMask    = $mask
+                        State         = 'Active'
+                        LeaseDuration = ([timespan]::FromDays($leaseDays))
+                        ErrorAction   = 'Stop'
+                    }
+
+                    $null = Add-DhcpServerv4Scope @scopeParameters
+                    $scopeAction = 'Created'
+
+                    Write-LogEntry -Message "Configured DHCP scope $scope" `
+                        -LogPath $logFilePath | Out-Null
+                }
+
+                # --- Scope options -------------------------------------------
+                $optionParameters = @{
+                    ScopeId     = $scope
+                    DnsDomain   = $computerSystem.Domain
+                    ErrorAction = 'SilentlyContinue'
+                }
+
+                if ([string]::IsNullOrWhiteSpace($dns)) {
+                    if ($serverAddress) { $optionParameters['DnsServer'] = $serverAddress }
+                }
+                else {
+                    $optionParameters['DnsServer'] = $dns
+                }
+
+                if (-not [string]::IsNullOrWhiteSpace($gateway)) {
+                    $optionParameters['Router'] = $gateway
+                }
+
+                Set-DhcpServerv4OptionValue @optionParameters
+
+                $finalScope = Get-DhcpServerv4Scope -ScopeId $scope -ErrorAction SilentlyContinue
+
+                [pscustomobject]@{
+                    ServerName       = $computerSystem.Name
+                    RoleInstalled    = $featureInstalled
+                    Authorised       = $true
+                    ScopesBefore     = $existingScopes
+                    ScopeId          = $scope
+                    ScopeAction      = $scopeAction
+                    ScopeState       = if ($finalScope) { $finalScope.State.ToString() }
+                                       else { 'Unknown' }
+                    Range            = '{0} - {1}' -f $rangeStart, $rangeEnd
+                    DnsServerOption  = $optionParameters['DnsServer']
+                    RouterOption     = if ([string]::IsNullOrWhiteSpace($gateway)) { 'not set' }
+                                       else { $gateway }
+                    ServiceStatus    = (Get-Service -Name 'dhcpserver').Status.ToString()
+                }
+            }
+
+        if ($result.ScopesBefore.Count -eq 0) {
+            Write-Verbose 'No DHCP pools existed on this server before this run.'
+        }
+        else {
+            Write-Verbose "Pools already present: $($result.ScopesBefore -join '; ')"
+        }
+
+        return $result
+    }
+}
+
+
 Export-ModuleMember -Function 'Write-LogEntry',
                               'Test-ServerConnection',
                               'New-DomainController',
                               'Join-ComputerToDomain',
                               'Connect-DomainComputer',
                               'Add-OrganizationalUnit',
-                              'Add-DomainUser'
+                              'Add-DomainUser',
+                              'New-DhcpScope'
