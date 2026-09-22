@@ -3,11 +3,9 @@
 <#
     ExecuteOnServer.psm1
 
-    Remote execution helper for the Mick and Macks Pies server build.
-
     Author:  Cooper Lane
     Company: ITWorks
-    Version: 1.1
+    Version: 1.2
 #>
 
 Set-StrictMode -Version Latest
@@ -17,6 +15,12 @@ function New-ServerSession {
 <#
     .SYNOPSIS
     Opens a PowerShell remoting session to a target server.
+
+    .DESCRIPTION
+    Creates a PSSession to the named computer and returns it to the caller so a
+    single connection can be reused across several administration functions.
+    The connection is tested with Test-WSMan before the session is attempted so
+    that a firewall or WinRM fault reports a clear message instead of a timeout.
 
     .PARAMETER ComputerName
     Name or IP address of the target server.
@@ -29,6 +33,12 @@ function New-ServerSession {
     Authenticate as the account already signed in, rather than prompting. Only
     useful once both machines are members of the same domain, where Kerberos
     can carry the signed-in identity across.
+
+    .EXAMPLE
+    $session = New-ServerSession -ComputerName 10.1.1.10
+
+    .EXAMPLE
+    $session = New-ServerSession -ComputerName MMPIES-SRV1 -UseCurrentUser
 
     .OUTPUTS
     System.Management.Automation.Runspaces.PSSession
@@ -82,7 +92,17 @@ function New-ServerSession {
             $newSession = New-PSSession @sessionParameters
         }
         catch {
-            throw "Could not open a session to '$ComputerName'. $($_.Exception.Message)"
+            $failureDetail = $_.Exception.Message
+
+            if ($failureDetail -match 'Default authentication may be used with an IP address') {
+                throw ("Could not open a session to '$ComputerName'. Kerberos cannot " +
+                       "authenticate to a bare IP address, because a service principal " +
+                       "name is registered against a host name and an address has none. " +
+                       "Use the computer's host name, or add a reverse lookup zone to DNS " +
+                       "so the address resolves to one. Original error: $failureDetail")
+            }
+
+            throw "Could not open a session to '$ComputerName'. $failureDetail"
         }
 
         Write-Verbose "Session $($newSession.Id) opened to '$ComputerName'."

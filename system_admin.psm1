@@ -7,7 +7,7 @@
 
     Author:  Cooper Lane
     Company: ITWorks
-    Version: 1.9
+    Version: 2.1
 #>
 
 Set-StrictMode -Version Latest
@@ -34,15 +34,6 @@ function Get-LogonDomainController {
 <#
     .SYNOPSIS
     Returns the host name of a domain controller this client can reach.
-
-    .DESCRIPTION
-    Internal helper. Remoting authenticates with Kerberos, which matches a
-    service principal name registered against a host. The domain name itself
-    has no such registration, so connecting to 'example.local' fails even
-    though the name resolves in DNS. This returns a real host name instead.
-
-    The domain controller that authenticated the current session is preferred.
-    If that is not available, the directory is queried for one.
 
     .OUTPUTS
     System.String
@@ -81,11 +72,6 @@ function Import-DirectoryCsv {
 <#
     .SYNOPSIS
     Reads a CSV on the client and checks it has the columns required.
-
-    .DESCRIPTION
-    Internal helper shared by the directory functions. Reading and validating
-    on the client means a missing file or a mistyped heading is reported before
-    a connection to the server is opened.
 
     .PARAMETER Path
     Full path of the CSV file.
@@ -209,6 +195,50 @@ function Get-NetworkAddress {
         }
 
         return ([ipaddress]$networkBytes).IPAddressToString
+    }
+}
+
+
+function Resolve-TargetName {
+<#
+    .SYNOPSIS
+    Turns an IP address into the host name remoting can authenticate to.
+
+    .PARAMETER Target
+    Host name or IP address supplied by the caller.
+
+    .OUTPUTS
+    System.String
+#>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory = $true, Position = 0)]
+        [ValidateNotNullOrEmpty()]
+        [string]$Target
+    )
+
+    process {
+        $parsedAddress = [ipaddress]::None
+
+        if (-not [ipaddress]::TryParse($Target, [ref]$parsedAddress)) {
+            return $Target
+        }
+
+        try {
+            $hostEntry = [System.Net.Dns]::GetHostEntry($Target)
+
+            if (-not [string]::IsNullOrWhiteSpace($hostEntry.HostName)) {
+                Write-Verbose "Resolved '$Target' to '$($hostEntry.HostName)'."
+                return $hostEntry.HostName
+            }
+        }
+        catch {
+            Write-Verbose ("'$Target' could not be resolved to a name. A reverse lookup " +
+                           "zone may be missing from DNS.")
+        }
+
+        return $Target
     }
 }
 
@@ -969,6 +999,12 @@ function Add-OrganizationalUnit {
     .PARAMETER LogPath
     Full path of the activity log on the domain controller.
 
+    .EXAMPLE
+    Add-OrganizationalUnit -CsvPath .\ous.csv -UseCurrentUser
+
+    .EXAMPLE
+    Add-OrganizationalUnit -CsvPath C:\ITWorks\ous.csv -Verbose
+
     .OUTPUTS
     System.Management.Automation.PSCustomObject
 #>
@@ -1618,6 +1654,314 @@ function New-DhcpScope {
 }
 
 
+function Get-TopTenError {
+<#
+    .SYNOPSIS
+    Collects the ten most recent system errors and writes them to a text file.
+
+    .PARAMETER IPAddress
+    IP address or host name of the computer to inspect. Defaults to the domain
+    controller that authenticated this session.
+
+    .PARAMETER OutputPath
+    File on the target computer to write the report to.
+
+    .PARAMETER MaximumEvents
+    How many errors to collect.
+
+    .PARAMETER Credential
+    Account used to connect. Prompted for unless -UseCurrentUser is supplied.
+
+    .PARAMETER UseCurrentUser
+    Connect as the signed-in domain account instead of prompting.
+
+    .PARAMETER LogPath
+    Full path of the activity log on the domain controller.
+
+    .OUTPUTS
+    System.Management.Automation.PSCustomObject
+#>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Position = 0)]
+        [ValidateNotNullOrEmpty()]
+        [string]$IPAddress,
+
+        [Parameter(Position = 1)]
+        [ValidateNotNullOrEmpty()]
+        [string]$OutputPath = 'C:\myLogs\toptenerrors.txt',
+
+        [Parameter()]
+        [ValidateRange(1, 100)]
+        [int]$MaximumEvents = 10,
+
+        [Parameter()]
+        [System.Management.Automation.PSCredential]$Credential,
+
+        [Parameter()]
+        [switch]$UseCurrentUser,
+
+        [Parameter()]
+        [ValidateNotNullOrEmpty()]
+        [string]$LogPath = $script:DefaultLogPath
+    )
+
+    begin {
+        $domainController = Get-LogonDomainController
+
+        if (-not $PSBoundParameters.ContainsKey('IPAddress')) {
+            $IPAddress = $domainController
+        }
+
+        # An IP address cannot be authenticated to with Kerberos, so it is
+        # turned into the host name behind it wherever DNS can supply one.
+        $targetName = Resolve-TargetName -Target $IPAddress
+
+        $connectionSplat = @{}
+
+        if ($UseCurrentUser) {
+            $connectionSplat['UseCurrentUser'] = $true
+        }
+        elseif ($PSBoundParameters.ContainsKey('Credential')) {
+            $connectionSplat['Credential'] = $Credential
+        }
+    }
+
+    process {
+        Write-Verbose "Collecting the last $MaximumEvents system errors from '$targetName'."
+
+        $report = Invoke-OnServer -ComputerName $targetName @connectionSplat -ErrorAction Stop `
+            -ArgumentList @($OutputPath, $MaximumEvents) -ScriptBlock {
+                param($reportPath, $eventCount)
+
+                $reportFolder = Split-Path -Path $reportPath -Parent
+
+                if (-not (Test-Path -Path $reportFolder)) {
+                    $null = New-Item -Path $reportFolder -ItemType Directory -Force
+                }
+
+                # Level 2 is Error in the Windows event schema.
+                $filter = @{ LogName = 'System'; Level = 2 }
+
+                $events = @(Get-WinEvent -FilterHashtable $filter -MaxEvents $eventCount `
+                    -ErrorAction SilentlyContinue)
+
+                $entries = @(
+                    $events | Select-Object -Property TimeCreated, Id, ProviderName,
+                        LevelDisplayName, Message
+                )
+
+                $header = "Top $eventCount system errors on $env:COMPUTERNAME"
+                $stamp = "Generated $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')"
+
+                $header, $stamp, '' | Out-File -FilePath $reportPath -Encoding UTF8
+                $entries | Format-List | Out-File -FilePath $reportPath -Encoding UTF8 -Append
+
+                [pscustomobject]@{
+                    ComputerName = $env:COMPUTERNAME
+                    ErrorsFound  = $entries.Count
+                    ReportPath   = $reportPath
+                    Entries      = $entries
+                }
+            }
+
+        $logMessage = "Retrieved top $MaximumEvents system errors from $($report.ComputerName)"
+
+        Invoke-OnServer -ComputerName $domainController @connectionSplat `
+            -ErrorAction SilentlyContinue -IncludeFunction @('Write-LogEntry') `
+            -ArgumentList @($logMessage, $LogPath) -ScriptBlock {
+                param($message, $logFilePath)
+
+                Write-LogEntry -Message $message -LogPath $logFilePath | Out-Null
+            } | Out-Null
+
+        if ($report.ErrorsFound -eq 0) {
+            Write-Verbose "No system errors were found on '$($report.ComputerName)'."
+        }
+
+        return $report
+    }
+}
+
+
+function Register-DiskCleanupTask {
+<#
+    .SYNOPSIS
+    Schedules a daily disk cleanup on a computer.
+
+    .PARAMETER IPAddress
+    IP address or host name of the computer to schedule the task on. Defaults to
+    this computer.
+
+    .PARAMETER At
+    Time of day the task runs.
+
+    .PARAMETER TaskName
+    Name the task is registered under.
+
+    .PARAMETER Credential
+    Account used to connect to a remote computer. Ignored for the local machine.
+
+    .PARAMETER UseCurrentUser
+    Connect as the signed-in domain account instead of prompting.
+
+    .PARAMETER LogPath
+    Full path of the activity log on the domain controller.
+
+    .OUTPUTS
+    System.Management.Automation.PSCustomObject
+#>
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Position = 0)]
+        [ValidateNotNullOrEmpty()]
+        [string]$IPAddress = 'localhost',
+
+        [Parameter(Position = 1)]
+        [ValidateNotNull()]
+        [datetime]$At = '06:00',
+
+        [Parameter()]
+        [ValidateNotNullOrEmpty()]
+        [string]$TaskName = 'ITWorks Daily Disk Cleanup',
+
+        [Parameter()]
+        [System.Management.Automation.PSCredential]$Credential,
+
+        [Parameter()]
+        [switch]$UseCurrentUser,
+
+        [Parameter()]
+        [ValidateNotNullOrEmpty()]
+        [string]$LogPath = $script:DefaultLogPath
+    )
+
+    begin {
+        $localNames = @('localhost', '127.0.0.1', '.', $env:COMPUTERNAME)
+        $isLocal = $localNames -contains $IPAddress
+
+        # Kerberos cannot authenticate to a bare IP address, so a remote target
+        # given as one is resolved to its host name first.
+        $targetName = if ($isLocal) { $IPAddress }
+                      else { Resolve-TargetName -Target $IPAddress }
+
+        $connectionSplat = @{}
+
+        if ($UseCurrentUser) {
+            $connectionSplat['UseCurrentUser'] = $true
+        }
+        elseif ($PSBoundParameters.ContainsKey('Credential')) {
+            $connectionSplat['Credential'] = $Credential
+        }
+
+        # The categories Disk Cleanup will act on. Chosen to remove only files
+        # Windows can recreate, so nothing a user would miss is deleted.
+        $cleanupCategories = @(
+            'Temporary Files',
+            'Temporary Internet Files',
+            'Downloaded Program Files',
+            'Thumbnail Cache',
+            'Delivery Optimization Files',
+            'Update Cleanup',
+            'Windows Error Reporting Files'
+        )
+
+        $work = {
+            param($taskLabel, $runTime, $categories)
+
+            $cleanupTool = Join-Path -Path $env:SystemRoot -ChildPath 'System32\cleanmgr.exe'
+
+            if (-not (Test-Path -Path $cleanupTool)) {
+                throw ("Disk Cleanup (cleanmgr.exe) is not installed on " +
+                       "$env:COMPUTERNAME, so the task cannot be scheduled.")
+            }
+
+            # Writing StateFlags0001 is what the /sageset dialog does. Without
+            # it, cleanmgr /sagerun:1 starts and immediately exits.
+            $cachesRoot = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\VolumeCaches'
+            $enabled = @()
+
+            foreach ($category in $categories) {
+                $categoryPath = Join-Path -Path $cachesRoot -ChildPath $category
+
+                if (Test-Path -Path $categoryPath) {
+                    New-ItemProperty -Path $categoryPath -Name 'StateFlags0001' -Value 2 `
+                        -PropertyType DWord -Force -ErrorAction SilentlyContinue | Out-Null
+
+                    $enabled += $category
+                }
+            }
+
+            $action = New-ScheduledTaskAction -Execute $cleanupTool -Argument '/sagerun:1'
+            $trigger = New-ScheduledTaskTrigger -Daily -At $runTime
+
+            $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' `
+                -LogonType ServiceAccount -RunLevel Highest
+
+            $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable `
+                -DontStopIfGoingOnBatteries -AllowStartIfOnBatteries
+
+            $registerParameters = @{
+                TaskName    = $taskLabel
+                Action      = $action
+                Trigger     = $trigger
+                Principal   = $principal
+                Settings    = $settings
+                Description = 'Removes temporary files each morning. Created by ITWorks.'
+                Force       = $true
+                ErrorAction = 'Stop'
+            }
+
+            $registered = Register-ScheduledTask @registerParameters
+
+            [pscustomobject]@{
+                ComputerName      = $env:COMPUTERNAME
+                TaskName          = $registered.TaskName
+                State             = $registered.State.ToString()
+                NextRunTime       = (Get-ScheduledTaskInfo -TaskName $taskLabel).NextRunTime
+                CategoriesEnabled = $enabled
+            }
+        }
+    }
+
+    process {
+        $timeText = $At.ToString('HH:mm')
+        $shouldProcessText = "Register '$TaskName' to run daily at $timeText"
+
+        if (-not $PSCmdlet.ShouldProcess($IPAddress, $shouldProcessText)) {
+            return
+        }
+
+        $arguments = @($TaskName, $At, $cleanupCategories)
+
+        if ($isLocal) {
+            Write-Verbose "Registering '$TaskName' on this computer."
+            $result = & $work @arguments
+        }
+        else {
+            Write-Verbose "Registering '$TaskName' on '$targetName'."
+
+            $result = Invoke-OnServer -ComputerName $targetName @connectionSplat `
+                -ErrorAction Stop -ArgumentList $arguments -ScriptBlock $work
+        }
+
+        $logMessage = "Registered daily disk cleanup task on $($result.ComputerName)"
+
+        Invoke-OnServer -ComputerName (Get-LogonDomainController) @connectionSplat `
+            -ErrorAction SilentlyContinue -IncludeFunction @('Write-LogEntry') `
+            -ArgumentList @($logMessage, $LogPath) -ScriptBlock {
+                param($message, $logFilePath)
+
+                Write-LogEntry -Message $message -LogPath $logFilePath | Out-Null
+            } | Out-Null
+
+        return $result
+    }
+}
+
+
 Export-ModuleMember -Function 'Write-LogEntry',
                               'Test-ServerConnection',
                               'New-DomainController',
@@ -1625,4 +1969,6 @@ Export-ModuleMember -Function 'Write-LogEntry',
                               'Connect-DomainComputer',
                               'Add-OrganizationalUnit',
                               'Add-DomainUser',
-                              'New-DhcpScope'
+                              'New-DhcpScope',
+                              'Get-TopTenError',
+                              'Register-DiskCleanupTask'
