@@ -7,7 +7,7 @@
 
     Author:  Cooper Lane
     Company: ITWorks
-    Version: 1.0
+    Version: 1.1
 #>
 
 Set-StrictMode -Version Latest
@@ -22,7 +22,13 @@ function New-ServerSession {
     Name or IP address of the target server.
 
     .PARAMETER Credential
-    Credentials used to authenticate. If omitted the user is prompted.
+    Credentials used to authenticate. If omitted the user is prompted, unless
+    -UseCurrentUser is supplied.
+
+    .PARAMETER UseCurrentUser
+    Authenticate as the account already signed in, rather than prompting. Only
+    useful once both machines are members of the same domain, where Kerberos
+    can carry the signed-in identity across.
 
     .OUTPUTS
     System.Management.Automation.Runspaces.PSSession
@@ -35,7 +41,10 @@ function New-ServerSession {
         [string]$ComputerName,
 
         [Parameter(Position = 1)]
-        [System.Management.Automation.PSCredential]$Credential
+        [System.Management.Automation.PSCredential]$Credential,
+
+        [Parameter()]
+        [switch]$UseCurrentUser
     )
 
     begin {
@@ -43,11 +52,11 @@ function New-ServerSession {
     }
 
     process {
-        if (-not $PSBoundParameters.ContainsKey('Credential')) {
+        if (-not $UseCurrentUser -and -not $PSBoundParameters.ContainsKey('Credential')) {
             $Credential = Get-Credential -Message "Enter administrator credentials for $ComputerName"
         }
 
-        if ($null -eq $Credential) {
+        if (-not $UseCurrentUser -and $null -eq $Credential) {
             throw "No credentials were supplied for '$ComputerName'. Cannot continue."
         }
 
@@ -62,8 +71,11 @@ function New-ServerSession {
 
         $sessionParameters = @{
             ComputerName = $ComputerName
-            Credential   = $Credential
             ErrorAction  = 'Stop'
+        }
+
+        if (-not $UseCurrentUser) {
+            $sessionParameters['Credential'] = $Credential
         }
 
         try {
@@ -137,6 +149,10 @@ function Invoke-OnServer {
     .PARAMETER Credential
     Credentials used when this function has to create its own session.
 
+    .PARAMETER UseCurrentUser
+    Authenticate as the account already signed in instead of prompting. Applies
+    only when this function creates its own session.
+
     .PARAMETER IncludeFunction
     Names of local functions to recreate inside the session before running.
 
@@ -167,6 +183,9 @@ function Invoke-OnServer {
         [Parameter(ParameterSetName = 'ByComputerName')]
         [System.Management.Automation.PSCredential]$Credential,
 
+        [Parameter(ParameterSetName = 'ByComputerName')]
+        [switch]$UseCurrentUser,
+
         [Parameter()]
         [string[]]$IncludeFunction = @()
     )
@@ -180,7 +199,10 @@ function Invoke-OnServer {
         else {
             $connectionParameters = @{ ComputerName = $ComputerName }
 
-            if ($PSBoundParameters.ContainsKey('Credential')) {
+            if ($UseCurrentUser) {
+                $connectionParameters['UseCurrentUser'] = $true
+            }
+            elseif ($PSBoundParameters.ContainsKey('Credential')) {
                 $connectionParameters['Credential'] = $Credential
             }
 
