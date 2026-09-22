@@ -7,7 +7,7 @@
 
     Author:  Cooper Lane
     Company: ITWorks
-    Version: 1.7
+    Version: 1.8
 #>
 
 Set-StrictMode -Version Latest
@@ -64,6 +64,97 @@ function Get-LogonDomainController {
             throw ("No domain controller could be identified for this client. Supply one " +
                    "with -DomainController. Underlying error: $($_.Exception.Message)")
         }
+    }
+}
+
+
+function Import-DirectoryCsv {
+<#
+    .SYNOPSIS
+    Reads a CSV on the client and checks it has the columns required.
+
+    .PARAMETER Path
+    Full path of the CSV file.
+
+    .PARAMETER RequiredColumn
+    Column headings that must be present.
+
+    .OUTPUTS
+    System.Object[]
+#>
+    [CmdletBinding()]
+    [OutputType([object[]])]
+    param(
+        [Parameter(Mandatory = $true, Position = 0)]
+        [ValidateNotNullOrEmpty()]
+        [string]$Path,
+
+        [Parameter(Mandatory = $true, Position = 1)]
+        [ValidateNotNullOrEmpty()]
+        [string[]]$RequiredColumn
+    )
+
+    process {
+        if (-not (Test-Path -Path $Path)) {
+            throw "The CSV file '$Path' was not found."
+        }
+
+        $rows = @(Import-Csv -Path $Path)
+
+        if ($rows.Count -eq 0) {
+            throw "The CSV file '$Path' has headings but no rows."
+        }
+
+        $columns = $rows[0].PSObject.Properties.Name
+        $missing = @($RequiredColumn | Where-Object { $columns -notcontains $_ })
+
+        if ($missing.Count -gt 0) {
+            throw ("The CSV file '$Path' is missing the column(s) " +
+                   "'$($missing -join ', ')'. Columns found: '$($columns -join ', ')'.")
+        }
+
+        Write-Verbose "Read $($rows.Count) row(s) from '$Path'."
+        return $rows
+    }
+}
+
+
+function Get-CsvValue {
+<#
+    .SYNOPSIS
+    Reads an optional column from a CSV row without failing when it is absent.
+
+    .PARAMETER Row
+    A row produced by Import-Csv.
+
+    .PARAMETER Name
+    Column name to read.
+
+    .OUTPUTS
+    System.String
+#>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory = $true, Position = 0)]
+        [ValidateNotNull()]
+        [psobject]$Row,
+
+        [Parameter(Mandatory = $true, Position = 1)]
+        [ValidateNotNullOrEmpty()]
+        [string]$Name
+    )
+
+    process {
+        if ($Row.PSObject.Properties.Name -contains $Name) {
+            $value = $Row.$Name
+
+            if ($null -ne $value) {
+                return $value.ToString().Trim()
+            }
+        }
+
+        return ''
     }
 }
 
@@ -803,8 +894,396 @@ function Connect-DomainComputer {
 }
 
 
+function Add-OrganizationalUnit {
+<#
+    .SYNOPSIS
+    Creates Organizational Units in Active Directory from a CSV file.
+
+    .PARAMETER CsvPath
+    Full path of the CSV file listing the units to create.
+
+    .PARAMETER ComputerName
+    Host name of the domain controller. Defaults to the one that authenticated
+    this session.
+
+    .PARAMETER Credential
+    Account used to connect. Prompted for unless -UseCurrentUser is supplied.
+
+    .PARAMETER UseCurrentUser
+    Connect as the signed-in domain account instead of prompting.
+
+    .PARAMETER LogPath
+    Full path of the activity log on the domain controller.
+
+    .OUTPUTS
+    System.Management.Automation.PSCustomObject
+#>
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory = $true, Position = 0)]
+        [ValidateNotNullOrEmpty()]
+        [string]$CsvPath,
+
+        [Parameter(Position = 1)]
+        [ValidateNotNullOrEmpty()]
+        [string]$ComputerName,
+
+        [Parameter()]
+        [System.Management.Automation.PSCredential]$Credential,
+
+        [Parameter()]
+        [switch]$UseCurrentUser,
+
+        [Parameter()]
+        [ValidateNotNullOrEmpty()]
+        [string]$LogPath = $script:DefaultLogPath
+    )
+
+    begin {
+        if (-not $PSBoundParameters.ContainsKey('ComputerName')) {
+            $ComputerName = Get-LogonDomainController
+        }
+
+        $rows = Import-DirectoryCsv -Path $CsvPath -RequiredColumn @('Name')
+
+        # Normalise every row on the client so the code running on the server
+        # can rely on all three properties being present.
+        $unitList = @(
+            foreach ($row in $rows) {
+                [pscustomobject]@{
+                    Name        = (Get-CsvValue -Row $row -Name 'Name')
+                    Path        = (Get-CsvValue -Row $row -Name 'Path') -replace ';', ','
+                    Description = (Get-CsvValue -Row $row -Name 'Description')
+                }
+            }
+        )
+
+        $blank = @($unitList | Where-Object { [string]::IsNullOrWhiteSpace($_.Name) })
+
+        if ($blank.Count -gt 0) {
+            throw "'$CsvPath' contains $($blank.Count) row(s) with an empty Name column."
+        }
+    }
+
+    process {
+        $shouldProcessText = "Create $($unitList.Count) Organizational Unit(s) from '$CsvPath'"
+
+        if (-not $PSCmdlet.ShouldProcess($ComputerName, $shouldProcessText)) {
+            return
+        }
+
+        $connectionSplat = @{ ComputerName = $ComputerName }
+
+        if ($UseCurrentUser) {
+            $connectionSplat['UseCurrentUser'] = $true
+        }
+        elseif ($PSBoundParameters.ContainsKey('Credential')) {
+            $connectionSplat['Credential'] = $Credential
+        }
+
+        $results = Invoke-OnServer @connectionSplat -ErrorAction Stop `
+            -IncludeFunction @('Write-LogEntry') `
+            -ArgumentList @($unitList, $LogPath) -ScriptBlock {
+                param($units, $logFilePath)
+
+                Import-Module -Name 'ActiveDirectory' -ErrorAction Stop
+
+                $domainRoot = (Get-ADDomain).DistinguishedName
+
+                foreach ($unit in $units) {
+                    $targetPath = $unit.Path
+
+                    if ([string]::IsNullOrWhiteSpace($targetPath)) {
+                        $targetPath = $domainRoot
+                    }
+
+                    $existing = Get-ADOrganizationalUnit -Filter "Name -eq '$($unit.Name)'" `
+                        -SearchBase $targetPath -ErrorAction SilentlyContinue
+
+                    if ($existing) {
+                        [pscustomobject]@{
+                            Name              = $unit.Name
+                            Action            = 'Skipped'
+                            DistinguishedName = $existing.DistinguishedName
+                            Detail            = 'Already exists'
+                        }
+
+                        continue
+                    }
+
+                    try {
+                        $newUnitParameters = @{
+                            Name        = $unit.Name
+                            Path        = $targetPath
+                            ErrorAction = 'Stop'
+                        }
+
+                        if (-not [string]::IsNullOrWhiteSpace($unit.Description)) {
+                            $newUnitParameters['Description'] = $unit.Description
+                        }
+
+                        $created = New-ADOrganizationalUnit @newUnitParameters -PassThru
+
+                        Write-LogEntry -Message "Added Organizational Unit $($unit.Name)" `
+                            -LogPath $logFilePath | Out-Null
+
+                        [pscustomobject]@{
+                            Name              = $unit.Name
+                            Action            = 'Created'
+                            DistinguishedName = $created.DistinguishedName
+                            Detail            = ''
+                        }
+                    }
+                    catch {
+                        [pscustomobject]@{
+                            Name              = $unit.Name
+                            Action            = 'Failed'
+                            DistinguishedName = ''
+                            Detail            = $_.Exception.Message
+                        }
+                    }
+                }
+            }
+
+        $created = @($results | Where-Object { $_.Action -eq 'Created' }).Count
+        $failed = @($results | Where-Object { $_.Action -eq 'Failed' }).Count
+
+        Write-Verbose "Created $created unit(s), $failed failure(s)."
+
+        if ($failed -gt 0) {
+            Write-Warning "$failed Organizational Unit(s) could not be created. See the Detail column."
+        }
+
+        return $results
+    }
+}
+
+
+function Add-DomainUser {
+<#
+    .SYNOPSIS
+    Creates Active Directory user accounts from a CSV file.
+
+    .PARAMETER CsvPath
+    Full path of the CSV file listing the staff to create.
+
+    .PARAMETER ComputerName
+    Host name of the domain controller. Defaults to the one that authenticated
+    this session.
+
+    .PARAMETER InitialPassword
+    Password set on every new account. Prompted for if omitted.
+
+    .PARAMETER ChangePasswordAtLogon
+    Require each new user to set their own password at first sign in. On by
+    default.
+
+    .PARAMETER Credential
+    Account used to connect. Prompted for unless -UseCurrentUser is supplied.
+
+    .PARAMETER UseCurrentUser
+    Connect as the signed-in domain account instead of prompting.
+
+    .PARAMETER LogPath
+    Full path of the activity log on the domain controller.
+
+    .OUTPUTS
+    System.Management.Automation.PSCustomObject
+#>
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory = $true, Position = 0)]
+        [ValidateNotNullOrEmpty()]
+        [string]$CsvPath,
+
+        [Parameter(Position = 1)]
+        [ValidateNotNullOrEmpty()]
+        [string]$ComputerName,
+
+        [Parameter()]
+        [System.Security.SecureString]$InitialPassword,
+
+        [Parameter()]
+        [bool]$ChangePasswordAtLogon = $true,
+
+        [Parameter()]
+        [System.Management.Automation.PSCredential]$Credential,
+
+        [Parameter()]
+        [switch]$UseCurrentUser,
+
+        [Parameter()]
+        [ValidateNotNullOrEmpty()]
+        [string]$LogPath = $script:DefaultLogPath
+    )
+
+    begin {
+        if (-not $PSBoundParameters.ContainsKey('ComputerName')) {
+            $ComputerName = Get-LogonDomainController
+        }
+
+        $requiredColumns = @('FirstName', 'LastName', 'SamAccountName', 'OU')
+        $rows = Import-DirectoryCsv -Path $CsvPath -RequiredColumn $requiredColumns
+
+        $userList = @(
+            foreach ($row in $rows) {
+                [pscustomobject]@{
+                    FirstName      = (Get-CsvValue -Row $row -Name 'FirstName')
+                    LastName       = (Get-CsvValue -Row $row -Name 'LastName')
+                    SamAccountName = (Get-CsvValue -Row $row -Name 'SamAccountName')
+                    OrganizationalUnit = (Get-CsvValue -Row $row -Name 'OU')
+                    Description    = (Get-CsvValue -Row $row -Name 'Description')
+                }
+            }
+        )
+
+        # A SamAccountName longer than 20 characters is rejected by Active
+        # Directory, so it is caught here with a message naming the offender.
+        foreach ($user in $userList) {
+            if ([string]::IsNullOrWhiteSpace($user.SamAccountName)) {
+                throw "'$CsvPath' contains a row with an empty SamAccountName column."
+            }
+
+            if ($user.SamAccountName.Length -gt 20) {
+                throw ("The account name '$($user.SamAccountName)' is " +
+                       "$($user.SamAccountName.Length) characters. Active Directory allows " +
+                       "a maximum of 20.")
+            }
+        }
+
+        if (-not $PSBoundParameters.ContainsKey('InitialPassword')) {
+            $InitialPassword = Read-Host -AsSecureString `
+                -Prompt 'Initial password for the new accounts'
+        }
+
+        if ($null -eq $InitialPassword -or $InitialPassword.Length -eq 0) {
+            throw 'An initial password is required to create accounts.'
+        }
+    }
+
+    process {
+        $shouldProcessText = "Create $($userList.Count) user account(s) from '$CsvPath'"
+
+        if (-not $PSCmdlet.ShouldProcess($ComputerName, $shouldProcessText)) {
+            return
+        }
+
+        $connectionSplat = @{ ComputerName = $ComputerName }
+
+        if ($UseCurrentUser) {
+            $connectionSplat['UseCurrentUser'] = $true
+        }
+        elseif ($PSBoundParameters.ContainsKey('Credential')) {
+            $connectionSplat['Credential'] = $Credential
+        }
+
+        $results = Invoke-OnServer @connectionSplat -ErrorAction Stop `
+            -IncludeFunction @('Write-LogEntry') `
+            -ArgumentList @($userList, $InitialPassword, $ChangePasswordAtLogon, $LogPath) `
+            -ScriptBlock {
+                param($people, $accountPassword, $mustChangePassword, $logFilePath)
+
+                Import-Module -Name 'ActiveDirectory' -ErrorAction Stop
+
+                $domain = Get-ADDomain
+
+                foreach ($person in $people) {
+                    $accountName = $person.SamAccountName
+
+                    $existing = Get-ADUser -Filter "SamAccountName -eq '$accountName'" `
+                        -ErrorAction SilentlyContinue
+
+                    if ($existing) {
+                        [pscustomobject]@{
+                            SamAccountName = $accountName
+                            Action         = 'Skipped'
+                            Location       = $existing.DistinguishedName
+                            Detail         = 'Account already exists'
+                        }
+
+                        continue
+                    }
+
+                    $unitName = $person.OrganizationalUnit
+
+                    $unit = Get-ADOrganizationalUnit -Filter "Name -eq '$unitName'" `
+                        -ErrorAction SilentlyContinue
+
+                    if (-not $unit) {
+                        [pscustomobject]@{
+                            SamAccountName = $accountName
+                            Action         = 'Failed'
+                            Location       = ''
+                            Detail         = "Organizational Unit '$unitName' does not exist"
+                        }
+
+                        continue
+                    }
+
+                    try {
+                        $displayName = "$($person.FirstName) $($person.LastName)".Trim()
+
+                        $newUserParameters = @{
+                            Name                  = $displayName
+                            DisplayName           = $displayName
+                            GivenName             = $person.FirstName
+                            Surname               = $person.LastName
+                            SamAccountName        = $accountName
+                            UserPrincipalName     = "$accountName@$($domain.DNSRoot)"
+                            Path                  = $unit.DistinguishedName
+                            AccountPassword       = $accountPassword
+                            Enabled               = $true
+                            ChangePasswordAtLogon = $mustChangePassword
+                            ErrorAction           = 'Stop'
+                        }
+
+                        if (-not [string]::IsNullOrWhiteSpace($person.Description)) {
+                            $newUserParameters['Description'] = $person.Description
+                        }
+
+                        $created = New-ADUser @newUserParameters -PassThru
+
+                        Write-LogEntry -Message 'Added a user to Domain' `
+                            -LogPath $logFilePath | Out-Null
+
+                        [pscustomobject]@{
+                            SamAccountName = $accountName
+                            Action         = 'Created'
+                            Location       = $created.DistinguishedName
+                            Detail         = ''
+                        }
+                    }
+                    catch {
+                        [pscustomobject]@{
+                            SamAccountName = $accountName
+                            Action         = 'Failed'
+                            Location       = ''
+                            Detail         = $_.Exception.Message
+                        }
+                    }
+                }
+            }
+
+        $created = @($results | Where-Object { $_.Action -eq 'Created' }).Count
+        $failed = @($results | Where-Object { $_.Action -eq 'Failed' }).Count
+
+        Write-Verbose "Created $created account(s), $failed failure(s)."
+
+        if ($failed -gt 0) {
+            Write-Warning "$failed account(s) could not be created. See the Detail column."
+        }
+
+        return $results
+    }
+}
+
+
 Export-ModuleMember -Function 'Write-LogEntry',
                               'Test-ServerConnection',
                               'New-DomainController',
                               'Join-ComputerToDomain',
-                              'Connect-DomainComputer'
+                              'Connect-DomainComputer',
+                              'Add-OrganizationalUnit',
+                              'Add-DomainUser'
