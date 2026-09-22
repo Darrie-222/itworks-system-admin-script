@@ -7,7 +7,7 @@
 
     Author:  Cooper Lane
     Company: ITWorks
-    Version: 1.5
+    Version: 1.7
 #>
 
 Set-StrictMode -Version Latest
@@ -30,6 +30,44 @@ Import-Module -Name $executeOnServerPath -Force -Global -ErrorAction Stop
 $script:DefaultLogPath = 'C:\myLogs\logs.txt'
 
 
+function Get-LogonDomainController {
+<#
+    .SYNOPSIS
+    Returns the host name of a domain controller this client can reach.
+
+    .OUTPUTS
+    System.String
+#>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param()
+
+    process {
+        if (-not [string]::IsNullOrWhiteSpace($env:LOGONSERVER)) {
+            $logonServer = $env:LOGONSERVER -replace '^\\\\', ''
+
+            if (-not [string]::IsNullOrWhiteSpace($logonServer)) {
+                Write-Verbose "Using the logon domain controller '$logonServer'."
+                return $logonServer
+            }
+        }
+
+        try {
+            $currentDomain =
+                [System.DirectoryServices.ActiveDirectory.Domain]::GetCurrentDomain()
+            $discovered = $currentDomain.FindDomainController().Name
+
+            Write-Verbose "Discovered domain controller '$discovered'."
+            return $discovered
+        }
+        catch {
+            throw ("No domain controller could be identified for this client. Supply one " +
+                   "with -DomainController. Underlying error: $($_.Exception.Message)")
+        }
+    }
+}
+
+
 function Write-LogEntry {
 <#
     .SYNOPSIS
@@ -40,9 +78,6 @@ function Write-LogEntry {
 
     .PARAMETER LogPath
     Full path of the log file. Defaults to C:\myLogs\logs.txt.
-
-    .EXAMPLE
-    Write-LogEntry -Message 'Checked if Domain Controller exists'
 
     .OUTPUTS
     System.String
@@ -82,12 +117,6 @@ function Test-ServerConnection {
     .SYNOPSIS
     Confirms the client can reach the server, run code on it, and write to its log.
 
-    .DESCRIPTION
-    Runs a short block of code on the target server which records an entry in the
-    activity log and reports the server name, operating system, and the line that
-    was just written. Use this before any other task, and whenever something is
-    not behaving as expected.
-
     .PARAMETER ComputerName
     Name or IP address of the target server.
 
@@ -96,12 +125,6 @@ function Test-ServerConnection {
 
     .PARAMETER LogPath
     Full path of the activity log on the server.
-
-    .EXAMPLE
-    Test-ServerConnection -ComputerName 10.1.1.10
-
-    .EXAMPLE
-    Test-ServerConnection -ComputerName 10.1.1.10 -Verbose
 
     .OUTPUTS
     System.Management.Automation.PSCustomObject
@@ -624,7 +647,164 @@ function Join-ComputerToDomain {
 }
 
 
+function Connect-DomainComputer {
+<#
+    .SYNOPSIS
+    Opens a PowerShell session to a computer in the domain.
+
+    .PARAMETER ComputerName
+    Name or IP address of the domain computer to connect to.
+
+    .PARAMETER DomainController
+    Host name of the domain controller used for the Active Directory checks and
+    for logging. Defaults to the domain controller that authenticated this
+    session. Give a host name, not the domain name: Kerberos matches a service
+    principal name registered against a host, and the domain name has none.
+
+    .PARAMETER Credential
+    Account used to connect. Prompted for unless -UseCurrentUser is supplied.
+
+    .PARAMETER UseCurrentUser
+    Connect as the signed-in domain account instead of prompting.
+
+    .PARAMETER LogPath
+    Full path of the activity log on the domain controller.
+
+    .OUTPUTS
+    System.Management.Automation.Runspaces.PSSession
+#>
+    [CmdletBinding()]
+    [OutputType([System.Management.Automation.Runspaces.PSSession])]
+    param(
+        [Parameter(Mandatory = $true, Position = 0)]
+        [ValidateNotNullOrEmpty()]
+        [string]$ComputerName,
+
+        [Parameter(Position = 1)]
+        [ValidateNotNullOrEmpty()]
+        [string]$DomainController,
+
+        [Parameter()]
+        [System.Management.Automation.PSCredential]$Credential,
+
+        [Parameter()]
+        [switch]$UseCurrentUser,
+
+        [Parameter()]
+        [ValidateNotNullOrEmpty()]
+        [string]$LogPath = $script:DefaultLogPath
+    )
+
+    begin {
+        # The brief requires the client to be a domain member before it may
+        # open sessions to other computers in the domain.
+        $clientSystem = Get-CimInstance -ClassName Win32_ComputerSystem
+
+        if (-not $clientSystem.PartOfDomain) {
+            throw ("This computer is not a member of a domain, so it cannot open a session " +
+                   "to a domain computer. Join it to the domain first.")
+        }
+
+        $clientName = $clientSystem.Name
+        Write-Verbose "Client '$clientName' is a member of '$($clientSystem.Domain)'."
+
+        if (-not $PSBoundParameters.ContainsKey('DomainController')) {
+            $DomainController = Get-LogonDomainController
+        }
+
+        # Build the connection arguments once and reuse them for both sessions.
+        $connectionSplat = @{}
+
+        if ($UseCurrentUser) {
+            $connectionSplat['UseCurrentUser'] = $true
+        }
+        elseif ($PSBoundParameters.ContainsKey('Credential')) {
+            $connectionSplat['Credential'] = $Credential
+        }
+    }
+
+    process {
+        $controllerSession = New-ServerSession -ComputerName $DomainController @connectionSplat
+        $targetSession = $null
+
+        try {
+            # --- Confirm the client is present in Active Directory ----------
+            $directoryCheck = Invoke-OnServer -Session $controllerSession -ErrorAction Stop `
+                -IncludeFunction @('Write-LogEntry') `
+                -ArgumentList @($clientName, $ComputerName, $LogPath) -ScriptBlock {
+                    param($client, $target, $logFilePath)
+
+                    Import-Module -Name 'ActiveDirectory' -ErrorAction Stop
+
+                    Write-LogEntry -Message "Checked $client is in Active Directory" `
+                        -LogPath $logFilePath | Out-Null
+
+                    $clientObject = Get-ADComputer -Filter "Name -eq '$client'" `
+                        -ErrorAction SilentlyContinue
+
+                    # The target may be given as an IP address, which has no
+                    # name to match in the directory, so this is advisory only.
+                    $targetObject = Get-ADComputer -Filter "Name -eq '$target'" `
+                        -ErrorAction SilentlyContinue
+
+                    [pscustomobject]@{
+                        ClientInDirectory = [bool]$clientObject
+                        TargetInDirectory = [bool]$targetObject
+                        ClientLocation    = if ($clientObject) {
+                                                $clientObject.DistinguishedName
+                                            }
+                                            else { $null }
+                    }
+                }
+
+            if (-not $directoryCheck.ClientInDirectory) {
+                throw ("'$clientName' has no computer object in Active Directory on " +
+                       "'$DomainController'. The client must be added to the directory " +
+                       "before it can open sessions to domain computers.")
+            }
+
+            Write-Verbose "'$clientName' found at $($directoryCheck.ClientLocation)."
+
+            if (-not $directoryCheck.TargetInDirectory) {
+                Write-Verbose ("'$ComputerName' was not matched by name in Active Directory. " +
+                               "This is expected when connecting by IP address.")
+            }
+
+            # --- Open the session the caller asked for ----------------------
+            $targetSession = New-ServerSession -ComputerName $ComputerName @connectionSplat
+
+            Invoke-OnServer -Session $controllerSession -ErrorAction SilentlyContinue `
+                -IncludeFunction @('Write-LogEntry') `
+                -ArgumentList @($clientName, $ComputerName, $LogPath) -ScriptBlock {
+                    param($client, $target, $logFilePath)
+
+                    Write-LogEntry -Message "Opened a remote session from $client to $target" `
+                        -LogPath $logFilePath | Out-Null
+                } | Out-Null
+
+            Write-Verbose "Session $($targetSession.Id) open to '$ComputerName'."
+            return $targetSession
+        }
+        catch {
+            if ($null -ne $targetSession) {
+                Remove-ServerSession -Session $targetSession -Confirm:$false `
+                    -ErrorAction SilentlyContinue
+            }
+
+            throw
+        }
+        finally {
+            if ($null -ne $controllerSession) {
+                Remove-ServerSession -Session $controllerSession -Confirm:$false `
+                    -ErrorAction SilentlyContinue
+            }
+        }
+    }
+}
+
+
 Export-ModuleMember -Function 'Write-LogEntry',
                               'Test-ServerConnection',
                               'New-DomainController',
-                              'Join-ComputerToDomain'
+                              'Join-ComputerToDomain',
+                              'Connect-DomainComputer'
